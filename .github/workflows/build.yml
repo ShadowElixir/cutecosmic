@@ -1,0 +1,161 @@
+name: Build CuteCosmic
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "00 22 * * *"
+      timezone: "Asia/Beirut"
+
+jobs:
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Detect ARM runner label
+        id: arm
+        run: |
+          . /etc/os-release
+          echo "label=ubuntu-${VERSION_ID}-arm" >> "$GITHUB_OUTPUT"
+
+      - name: Build matrix
+        id: set-matrix
+        env:
+          ARM_RUNNER: ${{ vars.ARM_RUNNER_LABEL || steps.arm.outputs.label }}
+        run: |
+          MATRIX=$(jq -nc --arg arm "$ARM_RUNNER" \
+            '[{runner: "ubuntu-latest", arch: "x86_64"}, {runner: $arm, arch: "aarch64"}]')
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+  check-commit:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    outputs:
+      sha: ${{ steps.get.outputs.sha }}
+      qt: ${{ steps.get.outputs.qt }}
+      tag: ${{ steps.get.outputs.tag }}
+      should_run: ${{ steps.get.outputs.should_run }}
+    steps:
+      - name: Fetch latest commit and Fedora Qt version
+        id: get
+        run: |
+          set -uo pipefail
+          dnf install -y git
+
+          FULL_SHA=""
+          for i in $(seq 1 10); do
+            FULL_SHA=$(git ls-remote https://github.com/IgKh/cutecosmic.git refs/heads/master 2>/dev/null | cut -f1)
+            if [[ "$FULL_SHA" =~ ^[0-9a-f]{40}$ ]]; then break; fi
+            FULL_SHA=""
+            sleep $((i*5))
+          done
+          if [ -z "$FULL_SHA" ]; then
+            echo "::error::Could not determine upstream commit SHA"
+            exit 1
+          fi
+          SHA="${FULL_SHA:0:7}"
+
+          # cutecosmic uses private Qt APIs: it must be rebuilt on every Qt update
+          QT=$(dnf repoquery --latest-limit=1 --qf '%{version}' qt6-qtbase-devel 2>/dev/null | tail -n1)
+          if [ -z "$QT" ]; then
+            echo "::error::Could not determine Fedora Qt version"
+            exit 1
+          fi
+          TAG="${SHA}-qt${QT}"
+
+          TAGS=""
+          for i in $(seq 1 5); do
+            if TAGS=$(git ls-remote --tags "https://github.com/${{ github.repository }}.git" 2>/dev/null); then break; fi
+            sleep $((i*3))
+          done
+
+          {
+            echo "sha=$SHA"
+            echo "qt=$QT"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+
+          if echo "$TAGS" | grep -q "refs/tags/${TAG}$"; then
+            echo "Release $TAG already exists."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New commit or new Qt version: $TAG"
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build RPM (${{ matrix.arch }})
+    needs: [check-commit, generate-matrix]
+    if: needs.check-commit.outputs.should_run == 'true'
+    runs-on: ${{ matrix.runner }}
+    container: fedora:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y git gcc-c++ cmake ninja-build rust cargo \
+            qt6-qtbase-devel qt6-qtbase-private-devel qt6-qtdeclarative-devel \
+            ruby rubygems ruby-devel rpm-build make redhat-rpm-config
+          gem install fpm
+
+      - name: Clone upstream CuteCosmic
+        run: git clone https://github.com/IgKh/cutecosmic.git --recurse-submodules repo
+
+      - name: Build
+        run: |
+          cd repo
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build build
+          DESTDIR="$PWD/stage" cmake --install build
+
+      - name: Package RPM
+        run: |
+          cd repo
+          fpm -s dir -t rpm \
+            -a "$(uname -m)" \
+            -n cutecosmic-qt6 \
+            -v "0~git${{ needs.check-commit.outputs.sha }}" \
+            --iteration "qt${{ needs.check-commit.outputs.qt }}" \
+            --description "CuteCosmic Qt platform theme (built against Qt ${{ needs.check-commit.outputs.qt }})" \
+            --url "https://github.com/IgKh/cutecosmic" \
+            --license GPL-3.0 \
+            --depends "qt6-qtbase = ${{ needs.check-commit.outputs.qt }}" \
+            --conflicts cutecosmic-qt6 \
+            --replaces cutecosmic-qt6 \
+            -C stage usr
+          mv *.rpm cutecosmic-qt6.${{ matrix.arch }}.rpm
+          ls -l *.rpm
+
+      - name: Upload RPM to Workflow Storage
+        uses: actions/upload-artifact@main
+        with:
+          name: cutecosmic-rpm-${{ matrix.arch }}
+          if-no-files-found: error
+          path: repo/*.rpm
+          retention-days: 1
+
+  publish-release:
+    name: Publish Release
+    needs: [check-commit, build]
+    if: needs.check-commit.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@main
+        with:
+          path: all-artifacts
+
+      - name: Create Single GitHub Release
+        uses: softprops/action-gh-release@master
+        with:
+          tag_name: ${{ needs.check-commit.outputs.tag }}
+          name: CuteCosmic (${{ needs.check-commit.outputs.sha }}, Qt ${{ needs.check-commit.outputs.qt }})
+          body: "CuteCosmic ${{ needs.check-commit.outputs.sha }} built against Fedora Qt ${{ needs.check-commit.outputs.qt }}."
+          draft: false
+          prerelease: false
+          make_latest: true
+          files: all-artifacts/**/*.rpm
